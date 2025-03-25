@@ -1,3 +1,5 @@
 node_modules/
+uploads/
+.env
 chattg.db
-/tmp/
+.DS_Store
