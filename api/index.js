@@ -1,73 +1,74 @@
 const express = require('express');
-const sqlite3 = require('sqlite3');
-const { open } = require('sqlite');
+const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { put } = require('@vercel/blob');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Configure file uploads
+// Configure Multer to use /tmp for temporary file storage
 const upload = multer({
-  dest: 'uploads/',
+  dest: '/tmp/uploads/',
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-// Initialize database
-let db;
+// Initialize Postgres
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+  ssl: { rejectUnauthorized: false }, // Required for Vercel Postgres
+});
+
+// Initialize database schema
 (async () => {
-  db = await open({
-    filename: './chattg.db',
-    driver: sqlite3.Database,
-  });
+  try {
+    const client = await pool.connect();
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        password TEXT,
+        display_name TEXT,
+        bio TEXT,
+        avatar TEXT,
+        is_admin BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        content TEXT,
+        user_id INTEGER,
+        file_url TEXT,
+        file_type TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        expires_at TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      );
+    `);
 
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE,
-      password TEXT,
-      display_name TEXT,
-      bio TEXT,
-      avatar TEXT,
-      is_admin BOOLEAN DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      content TEXT,
-      user_id INTEGER,
-      file_url TEXT,
-      file_type TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      user_id INTEGER,
-      expires_at DATETIME,
-      FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-  `);
-
-  const adminExists = await db.get("SELECT id FROM users WHERE is_admin = 1");
-  if (!adminExists) {
-    const hashedPassword = await bcrypt.hash("admin123", 10);
-    await db.run(
-      "INSERT INTO users (username, password, display_name, is_admin) VALUES (?, ?, ?, ?)",
-      "admin",
-      hashedPassword,
-      "Admin",
-      1
-    );
+    const adminExists = await client.query("SELECT id FROM users WHERE is_admin = TRUE");
+    if (!adminExists.rows.length) {
+      const hashedPassword = await bcrypt.hash(process.env.ADMIN_PASSWORD || "admin123", 10);
+      await client.query(
+        "INSERT INTO users (username, password, display_name, is_admin) VALUES ($1, $2, $3, $4)",
+        ["admin", hashedPassword, "Admin", true]
+      );
+    }
+    client.release();
+  } catch (error) {
+    console.error("Database initialization failed:", error);
+    process.exit(1);
   }
 })();
-
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-app.use('/uploads', express.static('uploads'));
 
 // Inline HTML and Frontend Logic
 const getAppHtml = (page, sessionId = '') => `
@@ -203,7 +204,9 @@ const getAppHtml = (page, sessionId = '') => `
       fetch('/api/user', { headers: { 'Authorization': sessionId } })
         .then(res => res.json())
         .then(user => {
-          document.getElementById('username-display').textContent = user.display_name || user.username;
+          document.getElementById('username-display').textContent = 
+            (user.display_name || user.username) + (user.is_admin ? ' (Admin)' : '');
+          window.isAdmin = user.is_admin;
         });
 
       document.getElementById('logout-btn').addEventListener('click', async () => {
@@ -260,6 +263,7 @@ const getAppHtml = (page, sessionId = '') => `
         div.innerHTML = \`
           <div style="font-size: 0.8em; color: #666;">
             \${msg.display_name || msg.username} - \${new Date(msg.created_at).toLocaleTimeString()}
+            \${window.isAdmin ? \`<button onclick="deleteMessage(\${msg.id})" style="float: right; color: red;">Delete</button>\` : ''}
           </div>
           <div>\${msg.content || ''}</div>
           \${msg.file_url ? (msg.file_type === 'image' ? 
@@ -270,11 +274,26 @@ const getAppHtml = (page, sessionId = '') => `
         messages.scrollTop = messages.scrollHeight;
       }
 
+      async function deleteMessage(messageId) {
+        if (confirm('Are you sure you want to delete this message?')) {
+          const res = await fetch(\`/api/message/\${messageId}\`, {
+            method: 'DELETE',
+            headers: { 'Authorization': sessionId }
+          });
+          if (res.ok) {
+            loadMessages();
+          } else {
+            alert('Failed to delete message');
+          }
+        }
+      }
+
       async function loadMessages() {
         const res = await fetch('/api/messages', { headers: { 'Authorization': sessionId } });
         const msgs = await res.json();
         const userRes = await fetch('/api/user', { headers: { 'Authorization': sessionId } });
         const user = await userRes.json();
+        messages.innerHTML = '';
         msgs.forEach(msg => addMessage(msg, msg.user_id === user.id));
       }
     }
@@ -297,92 +316,113 @@ app.post('/api/register', async (req, res) => {
   const { username, password, display_name } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await db.run(
-      "INSERT INTO users (username, password, display_name) VALUES (?, ?, ?)",
-      username,
-      hashedPassword,
-      display_name || username
+    const result = await pool.query(
+      "INSERT INTO users (username, password, display_name) VALUES ($1, $2, $3) RETURNING id",
+      [username, hashedPassword, display_name || username]
     );
-    res.json({ id: result.lastID, username });
+    res.json({ id: result.rows[0].id, username });
   } catch (error) {
-    res.status(error.errno === 19 ? 400 : 500).json({ error: error.errno === 19 ? "Username exists" : "Registration failed" });
+    res.status(error.code === '23505' ? 400 : 500).json({ error: error.code === '23505' ? "Username exists" : "Registration failed" });
   }
 });
 
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  const user = await db.get("SELECT * FROM users WHERE username = ?", username);
+  const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+  const user = result.rows[0];
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: "Invalid credentials" });
   }
   const sessionId = uuidv4();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  await db.run(
-    "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)",
-    sessionId,
-    user.id,
-    expiresAt.toISOString()
+  await pool.query(
+    "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)",
+    [sessionId, user.id, expiresAt]
   );
-  res.json({ id: user.id, username: user.username, display_name: user.display_name, sessionId, isAdmin: user.is_admin });
+  res.json({ id: user.id, username: user.username, display_name: user.display_name, sessionId, is_admin: user.is_admin });
 });
 
 app.post('/api/logout', async (req, res) => {
   const { sessionId } = req.body;
-  await db.run("DELETE FROM sessions WHERE id = ?", sessionId);
+  await pool.query("DELETE FROM sessions WHERE id = $1", [sessionId]);
   res.json({ success: true });
 });
 
 app.get('/api/user', async (req, res) => {
   const sessionId = req.headers.authorization;
   if (!sessionId) return res.status(401).json({ error: "Unauthorized" });
-  const session = await db.get("SELECT * FROM sessions WHERE id = ? AND expires_at > datetime('now')", sessionId);
-  if (!session) return res.status(401).json({ error: "Session expired" });
-  const user = await db.get("SELECT id, username, display_name, bio, avatar FROM users WHERE id = ?", session.user_id);
-  res.json(user);
+  const session = await pool.query("SELECT * FROM sessions WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP", [sessionId]);
+  if (!session.rows.length) return res.status(401).json({ error: "Session expired" });
+  const user = await pool.query("SELECT id, username, display_name, bio, avatar, is_admin FROM users WHERE id = $1", [session.rows[0].user_id]);
+  res.json(user.rows[0]);
 });
 
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   const sessionId = req.headers.authorization;
-  if (!sessionId || !await db.get("SELECT * FROM sessions WHERE id = ? AND expires_at > datetime('now')", sessionId)) {
+  const session = await pool.query("SELECT * FROM sessions WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP", [sessionId]);
+  if (!session.rows.length) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
   const ext = path.extname(req.file.originalname);
   const filename = `${uuidv4()}${ext}`;
-  const filepath = path.join('uploads', filename);
-  fs.renameSync(req.file.path, filepath);
+  const blob = await put(filename, fs.readFileSync(req.file.path), {
+    access: 'public',
+    token: process.env.BLOB_READ_WRITE_TOKEN,
+  });
+
   let fileType = "other";
   if (req.file.mimetype.startsWith("image/")) fileType = "image";
   else if (req.file.mimetype.startsWith("video/")) fileType = "video";
-  res.json({ url: `/uploads/${filename}`, type: fileType, originalName: req.file.originalname });
+
+  fs.unlinkSync(req.file.path); // Clean up temporary file
+
+  res.json({ url: blob.url, type: fileType, originalName: req.file.originalname });
 });
 
 app.post('/api/message', async (req, res) => {
   const sessionId = req.headers.authorization;
-  const session = await db.get("SELECT * FROM sessions WHERE id = ? AND expires_at > datetime('now')", sessionId);
-  if (!session) return res.status(401).json({ error: "Unauthorized" });
+  const session = await pool.query("SELECT * FROM sessions WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP", [sessionId]);
+  if (!session.rows.length) return res.status(401).json({ error: "Unauthorized" });
   const { content, file } = req.body;
-  const result = await db.run(
-    "INSERT INTO messages (content, user_id, file_url, file_type) VALUES (?, ?, ?, ?)",
-    content,
-    session.user_id,
-    file?.url,
-    file?.type
+  const result = await pool.query(
+    "INSERT INTO messages (content, user_id, file_url, file_type) VALUES ($1, $2, $3, $4) RETURNING *",
+    [content, session.rows[0].user_id, file?.url, file?.type]
   );
-  const message = await db.get(
-    "SELECT m.*, u.username, u.display_name FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = ?",
-    result.lastID
+  const message = await pool.query(
+    "SELECT m.*, u.username, u.display_name FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $1",
+    [result.rows[0].id]
   );
-  res.json(message);
+  res.json(message.rows[0]);
 });
 
 app.get('/api/messages', async (req, res) => {
   const { before = '', limit = 50 } = req.query;
   const query = `SELECT m.*, u.username, u.display_name FROM messages m JOIN users u ON m.user_id = u.id
-    ${before ? 'WHERE m.id < ?' : ''} ORDER BY m.id DESC LIMIT ?`;
+    ${before ? 'WHERE m.id < $1' : ''} ORDER BY m.id DESC LIMIT $2`;
   const params = before ? [before, limit] : [limit];
-  const messages = await db.all(query, ...params);
-  res.json(messages.reverse());
+  const messages = await pool.query(query, params);
+  res.json(messages.rows.reverse());
 });
 
-app.listen(3000, () => console.log('Server running at http://localhost:3000'));
+app.delete('/api/message/:id', async (req, res) => {
+  const sessionId = req.headers.authorization;
+  const session = await pool.query("SELECT * FROM sessions WHERE id = $1 AND expires_at > CURRENT_TIMESTAMP", [sessionId]);
+  if (!session.rows.length) return res.status(401).json({ error: "Unauthorized" });
+
+  const user = await pool.query("SELECT is_admin FROM users WHERE id = $1", [session.rows[0].user_id]);
+  if (!user.rows[0].is_admin) return res.status(403).json({ error: "Forbidden" });
+
+  const messageId = req.params.id;
+  await pool.query("DELETE FROM messages WHERE id = $1", [messageId]);
+  res.json({ success: true });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: "Something went wrong!" });
+});
+
+module.exports = app;
